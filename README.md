@@ -1,5 +1,5 @@
 # IPv6 Enumerator
-An IPv6 network scanner.
+Host discovery in IPv6 networks.
 
 
 ### Usage:
