@@ -1,6 +1,8 @@
 # IPv6 Enumerator
 An IPv6 network scanner.
 
+
+### Usage:
 ```
 usage: scanner.py [-h] [-l] [-w WAIT] [-s] [-n] [--max-prefix MAX_PREFIX] [interface]
 
@@ -18,4 +20,9 @@ options:
   --max-prefix MAX_PREFIX
                         Maximum prefix length for network scanning (example: 120 for /120 = 256 addresses). 
                         Smaller number = larger network = longer scan time. Default: 125 for /125 = 8 addresses
+```
+
+### Install:
+```
+pip install netifaces scapy
 ```
