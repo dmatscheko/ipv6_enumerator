@@ -4,7 +4,7 @@ Host discovery in IPv6 networks.
 
 ### Usage:
 ```
-usage: scanner.py [-h] [-l] [-w WAIT] [-s] [-n] [--max-prefix MAX_PREFIX] [interface]
+sudo python scanner.py [-h] [-l] [-w WAIT] [-s] [-n] [--max-prefix MAX_PREFIX] [interface]
 
 IPv6 network scanner
 
@@ -23,6 +23,12 @@ options:
 ```
 
 ### Install:
-```
+```bash
+# optional:
+git clone https://github.com/dmatscheko/ipv6_enumerator.git
+cd ipv6_enumerator
+python -m venv venv
+source venv/bin/activate
+# necessary:
 pip install netifaces scapy
 ```
