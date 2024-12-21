@@ -4,7 +4,7 @@ Host discovery in IPv6 networks.
 
 ### Usage:
 ```
-sudo python scanner.py [-h] [-l] [-w WAIT] [-s] [-n] [--max-prefix MAX_PREFIX] [interface]
+sudo python scanner.py [-h] [-l] [-w WAIT] [-s] [-n] [--subnet-size SUBNET_SIZE] [interface]
 
 IPv6 network scanner
 
@@ -17,8 +17,8 @@ options:
   -w WAIT, --wait WAIT  Time to wait for responses after each multicast probe (default: 0.5s)
   -s, --solicit         Include solicited-node multicast scanning
   -n, --network         Scan networks of discovered hosts (default: /125 = 8 addresses)
-  --max-prefix MAX_PREFIX
-                        Maximum prefix length for network scanning (example: 120 for /120 = 256 addresses). 
+  --subnet-size SUBNET_SIZE
+                        Subnet size is the prefix length for network scanning (example: 120 for /120 = 256 addresses). 
                         Smaller number = larger network = longer scan time. Default: 125 for /125 = 8 addresses
 ```
 
