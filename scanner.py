@@ -1,76 +1,294 @@
 #!/usr/bin/env python3
+"""
+IPv6 Network Scanner
+
+This script provides IPv6 host discovery using:
+- Multicast group discovery
+- Neighbor solicitation
+- Solicited-node multicast scanning
+- Network scanning
+
+The scanner supports various discovery methods and provides detailed output about
+discovered hosts, their MAC addresses, and multicast group memberships.
+
+Required packages:
+    - scapy
+    - netifaces
+    - ipaddress
+
+Usage:
+    sudo python3 scanner.py [-h] [-l] [-w WAIT] [-s] [-n] [--subnet-size SUBNET_SIZE] [interface]
+
+Author: D. Matscheko
+License: GPLv3
+Version: 0.0.2
+"""
+
 import sys
+import os
 import socket
 import time
 import struct
-import netifaces
 import argparse
 import ipaddress
-from scapy.all import *
+from typing import Dict, Set, Tuple, Optional, Union, Callable, List, Type
+import netifaces
+from scapy.all import (
+    conf, AsyncSniffer, IPv6, ICMPv6EchoRequest, ICMPv6EchoReply,
+    ICMPv6ND_NA, ICMPv6ND_NS, ICMPv6NDOptSrcLLAddr, Ether, in6_chksum,
+    send, Packet
+)
 from collections import defaultdict
+from contextlib import contextmanager
+
+
+class DiscoveryState:
+    """Manages state during discovery process."""
+    def __init__(self, addr_padding: int = 45):
+        self.current_group: Optional[str] = None
+        self.addr_padding: int = addr_padding
+        self.src_addr: Optional[str] = None
+
+
+class ProbeType:
+    """
+    Represents a type of IPv6 probe with its configuration.
+    
+    Attributes:
+        name: Unique identifier for the probe type
+        description: Human-readable description of what this probe does
+        packet_creator: Function that creates the probe packet
+        response_types: List of scapy packet types to expect as responses
+        needs_src_addr: Whether this probe requires a source address
+        handler: Function that handles sending the probes
+    """
+    def __init__(self, *, 
+                 name: str,
+                 description: str,
+                 packet_creator: Callable,
+                 response_types: List[Type[Packet]],
+                 needs_src_addr: bool = False,
+                 handler: Optional[Callable] = None):
+        self.name = name
+        self.description = description
+        self.packet_creator = packet_creator
+        self.response_types = response_types
+        self.needs_src_addr = needs_src_addr
+        self.handler = handler
+
+
+class ICMPv6PacketBuilder:
+    """Builder for ICMPv6 packets."""
+    def __init__(self, if_mac: str):
+        self.if_mac = if_mac
+        self.mac_bytes = bytes.fromhex(if_mac.replace(':', ''))
+
+    def create_ping(self, seq: int) -> bytes:
+        """Create an ICMPv6 Echo Request packet."""
+        return self._create_icmpv6_packet(
+            icmp_type=128,  # Echo Request
+            icmp_code=0,
+            additional_data=struct.pack('!HH', os.getpid() & 0xFFFF, seq) + b"PROBE"
+        )
+
+    def create_network_ping(self, target_addr: str) -> bytes:
+        """Create an ICMPv6 Echo Request packet for a specific target."""
+        return self._create_icmpv6_packet(
+            icmp_type=128,  # Echo Request
+            icmp_code=0,
+            additional_data=struct.pack('!HH', os.getpid() & 0xFFFF, 1) + b"PROBE"
+        )
+
+    def create_multicast_ns(self, seq: int = None) -> bytes:
+        """Create a multicast Neighbor Solicitation packet."""
+        target_addr = socket.inet_pton(socket.AF_INET6, "::")
+        return self._create_ns_packet(target_addr)
+
+    def create_unicast_ns(self, src_addr: str, target_addr: str) -> bytes:
+        """Create a unicast Neighbor Solicitation packet."""
+        target = socket.inet_pton(socket.AF_INET6, target_addr)
+        return self._create_ns_packet(
+            target,
+            src_addr=src_addr,
+            dst_addr=target_addr,
+            add_checksum=True
+        )
+
+    def _create_ns_packet(self, target: bytes, src_addr: str = None, 
+                         dst_addr: str = None, add_checksum: bool = False) -> bytes:
+        """Create base NS packet with optional checksum."""
+        # Source Link-Layer Address option
+        lladdr_opt = struct.pack('!BB', 1, 1) + self.mac_bytes
+        
+        packet = self._create_icmpv6_packet(
+            icmp_type=135,  # Neighbor Solicitation
+            icmp_code=0,
+            additional_data=target + lladdr_opt
+        )
+        
+        if add_checksum and src_addr and dst_addr:
+            packet = self._add_checksum(packet, src_addr, dst_addr)
+            
+        return packet
+
+    def _create_icmpv6_packet(self, icmp_type: int, icmp_code: int, 
+                             additional_data: bytes = b'') -> bytes:
+        """Create a basic ICMPv6 packet."""
+        return struct.pack('!BBH', icmp_type, icmp_code, 0) + additional_data
+
+    def _add_checksum(self, packet: bytes, src_addr: str, dst_addr: str) -> bytes:
+        """Add checksum to an ICMPv6 packet."""
+        checksum = in6_chksum(
+            socket.IPPROTO_ICMPV6,
+            IPv6(src=src_addr, dst=dst_addr),
+            packet
+        )
+        return packet[:2] + struct.pack('!H', checksum) + packet[4:]
+
 
 class IPv6Scanner:
-    def __init__(self, interface):
+    """
+    IPv6 network scanner implementing multiple discovery methods.
+    
+    This class provides functionality for:
+    - Multicast group discovery
+    - Neighbor solicitation
+    - Network scanning
+    - Solicited-node multicast scanning
+    
+    Attributes:
+        interface (str): Network interface to use for scanning
+        discovered_hosts (dict): Mapping of IP addresses to (MAC, groups) tuples
+        probe_wait (float): Wait time between probes in seconds
+        network_scan (bool): Whether to perform network scanning
+        subnet_size (int): Minimum prefix length for network scanning
+        solicit_scan (bool): Whether to perform solicited-node scanning
+    """
+    
+    MULTICAST_GROUPS = {
+        'ff02::1': 'ALL',      # All Nodes
+        'ff02::2': 'RTR',      # All Routers
+        'ff02::1:2': 'DHCP',   # All DHCP Servers
+        'ff02::16': 'MLDv2',   # All MLDv2-capable Routers
+        'ff02::1:3': 'RELAY'   # All DHCP Relays
+    }
+
+    def __init__(self, interface: str):
+        """
+        Initialize the IPv6Scanner.
+
+        Args:
+            interface: Network interface name to use for scanning
+        """
         self.interface = interface
-        self.discovered_hosts = {}  # IP to (MAC, set(groups)) mapping
+        self.discovered_hosts: Dict[str, Tuple[Optional[str], Set[str]]] = {}
         self.probe_wait = 0.5  # Default wait time between probes
         self.network_scan = False
-        self.subnet_size_limit = 120  # Default minimum prefix length (/120 = 256 addresses)
+        self.subnet_size = 120  # Default prefix length
         self.solicit_scan = False
         
-        # Set up Scapy settings
         conf.verb = 0
+        self.if_mac = self._get_interface_mac()
+        self.packet_builder = ICMPv6PacketBuilder(self.if_mac)
         
-        # Try to get interface MAC address
-        try:
-            if_addrs = netifaces.ifaddresses(interface)
-            if netifaces.AF_LINK in if_addrs:
-                self.if_mac = if_addrs[netifaces.AF_LINK][0]['addr']
-            else:
-                self.if_mac = "00:00:00:00:00:00"
-        except:
-            self.if_mac = "00:00:00:00:00:00"
-        
-        # Multicast groups definition moved to class level for easier access
-        self.multicast_groups = {
-            'ff02::1': 'ALL',      # All Nodes
-            'ff02::2': 'RTR',      # All Routers
-            'ff02::1:2': 'DHCP',   # All DHCP Servers
-            'ff02::16': 'MLDv2',   # All MLDv2-capable Routers
-            'ff02::1:3': 'RELAY'   # All DHCP Relays
+        # Initialize probe types
+        self.probes = self._init_probes()
+
+    def _init_probes(self) -> Dict[str, ProbeType]:
+        """Initialize available probe types."""
+        probes = {
+            probe.name: probe for probe in [
+                ProbeType(
+                    name='ns',
+                    description='ICMPv6 Multicast Groups Neighbor Solicitation',
+                    packet_creator=self.packet_builder.create_multicast_ns,
+                    response_types=[ICMPv6ND_NA, ICMPv6ND_NS],
+                    handler=self._handle_standard_probe
+                ),
+                ProbeType(
+                    name='ping',
+                    description='ICMPv6 Multicast Groups Echo Request',
+                    packet_creator=self.packet_builder.create_ping,
+                    response_types=[ICMPv6EchoReply],
+                    handler=self._handle_standard_probe
+                ),
+                ProbeType(
+                    name='solicit',
+                    description='ICMPv6 Solicited-Node Multicast',
+                    packet_creator=self.packet_builder.create_unicast_ns,
+                    response_types=[ICMPv6ND_NA, ICMPv6ND_NS],
+                    needs_src_addr=True,
+                    handler=self._handle_solicited_node_probe
+                ),
+                ProbeType(
+                    name='network',
+                    description='ICMPv6 Nearby Network',
+                    packet_creator=self.packet_builder.create_network_ping,
+                    response_types=[ICMPv6EchoReply],
+                    handler=self._handle_network_probe
+                )
+            ]
         }
+        return probes
+
+    def _get_interface_mac(self) -> str:
+        """
+        Get the MAC address of the specified interface.
         
+        Returns:
+            str: MAC address or default "00:00:00:00:00:00" if not found
+        """
+        try:
+            if_addrs = netifaces.ifaddresses(self.interface)
+            if netifaces.AF_LINK in if_addrs:
+                return if_addrs[netifaces.AF_LINK][0]['addr']
+        except Exception:
+            pass
+        return "00:00:00:00:00:00"
+
     @staticmethod
-    def list_interfaces():
-        """List active network interfaces and their addresses"""
+    def list_interfaces() -> list:
+        """
+        List active network interfaces and their addresses.
+        
+        Returns:
+            list: List of active interface names
+        """
         print("[*] Active network interfaces:")
         active_interfaces = []
         
         for iface in netifaces.interfaces():
             # Skip loopback interfaces
-            if iface.startswith('lo') or iface.startswith('localhost'):
+            if iface.startswith(('lo', 'localhost')):
                 continue
                 
             addrs = netifaces.ifaddresses(iface)
-            has_addresses = (netifaces.AF_INET in addrs and addrs[netifaces.AF_INET]) or \
-                          (netifaces.AF_INET6 in addrs and [a for a in addrs[netifaces.AF_INET6] 
-                           if not a['addr'].startswith('fe80:')])
+            has_addresses = (
+                (netifaces.AF_INET in addrs and addrs[netifaces.AF_INET]) or
+                (netifaces.AF_INET6 in addrs and [
+                    a for a in addrs[netifaces.AF_INET6]
+                    if not a['addr'].startswith('fe80:')
+                ])
+            )
             
             if has_addresses:
                 print(f"\nInterface: {iface}")
                 active_interfaces.append(iface)
                 
+                # Print IPv4 addresses
                 if netifaces.AF_INET in addrs:
                     print("  IPv4 addresses:")
                     for addr in addrs[netifaces.AF_INET]:
                         print(f"    {addr['addr']}")
                 
+                # Print IPv6 addresses
                 if netifaces.AF_INET6 in addrs:
                     print("  IPv6 addresses:")
                     for addr in addrs[netifaces.AF_INET6]:
                         if not addr['addr'].startswith('fe80:'):
                             print(f"    {addr['addr']}")
                 
+                # Print MAC address
                 if netifaces.AF_LINK in addrs:
                     print("  MAC address:")
                     print(f"    {addrs[netifaces.AF_LINK][0]['addr']}")
@@ -79,9 +297,25 @@ class IPv6Scanner:
             print("\nNo active interfaces with IPv4/IPv6 addresses found!")
             
         return active_interfaces
+
+    @contextmanager
+    def _create_socket(self) -> socket.socket:
+        """Create and configure ICMPv6 socket as context manager."""
+        sock = self.create_icmp6_socket()
+        if not sock:
+            raise RuntimeError("Failed to create ICMPv6 socket")
+        try:
+            yield sock
+        finally:
+            sock.close()
+
+    def create_icmp6_socket(self) -> Optional[socket.socket]:
+        """
+        Create a raw ICMPv6 socket with appropriate options.
         
-    def create_icmp6_socket(self):
-        """Create a raw ICMPv6 socket"""
+        Returns:
+            Optional[socket.socket]: Configured socket or None if creation fails
+        """
         try:
             sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, struct.pack("LL", 2, 0))
@@ -93,8 +327,17 @@ class IPv6Scanner:
             print(f"[-] Error creating socket: {str(e)}")
             return None
 
-    def extract_mac_from_ipv6(self, ipv6_addr):
-        """Extract MAC address from EUI-64 based IPv6 address"""
+    @staticmethod
+    def extract_mac_from_ipv6(ipv6_addr: str) -> Optional[str]:
+        """
+        Extract MAC address from EUI-64 based IPv6 address.
+        
+        Args:
+            ipv6_addr: IPv6 address to extract MAC from
+            
+        Returns:
+            Optional[str]: MAC address or None if extraction fails
+        """
         try:
             segments = ipv6_addr.split(':')
             if len(segments) != 8:
@@ -120,99 +363,61 @@ class IPv6Scanner:
             return None
         return None
 
-    def format_flags(self, groups):
-        """Format group flags in a consistent order"""
+    @staticmethod
+    def format_flags(groups: Set[str]) -> str:
+        """Format group flags in a consistent order."""
         return ' '.join(sorted(groups))
+
+    def probe_multicast(self, probe: Union[str, ProbeType]) -> None:
+        """
+        Enhanced multicast probing with unified packet handling.
         
-    def scan_network(self, network):
-        """Scan an IPv6 network if it's within size limits"""
-        try:
-            net = ipaddress.IPv6Network(network, strict=False)
+        Args:
+            probe: Either a probe type name (str) or ProbeType instance
+        """
+        # Convert string to ProbeType if necessary
+        if isinstance(probe, str):
+            if probe not in self.probes:
+                raise ValueError(f"Invalid probe type: {probe}")
+            probe = self.probes[probe]
             
-            if net.prefixlen < self.subnet_size_limit:
-                print(f"\n[!] Network {network} too large (/{net.prefixlen}). Use --max-prefix to allow scanning networks larger than /{self.subnet_size_limit}")
+        state = DiscoveryState()
+        
+        # Initialize probe-specific requirements
+        if probe.needs_src_addr:
+            state.src_addr = self._get_link_local_address()
+            if not state.src_addr:
+                print("[-] Could not find link-local address for interface")
                 return
+            state.src_addr = str(ipaddress.IPv6Address(state.src_addr))
+        
+        self._print_probe_header(probe.description)
+        
+        try:
+            with self._setup_sniffer(probe, state) as sniffer:
+                with self._create_socket() as sock:
+                    probe.handler(sock, probe, state)
                 
-            total_addrs = 2 ** (128 - net.prefixlen)
-            print(f"\n[*] Scanning network: {network}")
-            print(f"[*] Network size: {total_addrs:,} addresses")
-            
-            def process_response(pkt):
-                """Process response packets from ping"""
-                if IPv6 in pkt and ICMPv6EchoReply in pkt:
-                    src = pkt[IPv6].src
-                    if '%' in src:
-                        src = src.split('%')[0]
-                    if src not in self.discovered_hosts:
-                        mac = None
-                        if Ether in pkt:
-                            mac = pkt[Ether].src
-                        self.discovered_hosts[src] = (mac, {'NET'})
-                        print(f"[+] Host discovered via network scan: {src}")
-            
-            # Start sniffer for responses
-            sniffer = AsyncSniffer(
-                iface=self.interface,
-                filter="icmp6[icmp6type] == 129",  # ICMPv6 Echo Reply
-                prn=process_response,
-                store=0
-            )
-            sniffer.start()
-            
-            # Send pings in batches
-            batch_size = 50
-            addrs = list(net.hosts())
-            for i in range(0, len(addrs), batch_size):
-                batch = addrs[i:i + batch_size]
-                for addr in batch:
-                    # Send ICMPv6 echo request
-                    ping = IPv6(dst=str(addr))/ICMPv6EchoRequest()
-                    send(ping, verbose=0)
-                time.sleep(self.probe_wait)
-                
-            # Wait for final responses
-            time.sleep(self.probe_wait * 2)
-            sniffer.stop()
+                time.sleep(self.probe_wait * 2)
                 
         except Exception as e:
-            print(f"\n[-] Error scanning network {network}: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            print(f"[-] Error during {probe.description} scanning: {str(e)}")
 
-    def probe_solicited_node(self):
-        """Probe solicited-node multicast addresses"""
-        print("\n" + "-" * 80)
-        print("[*] Starting solicited-node multicast scan")
-        print("-" * 80 + "\n")
-
-        def expand_ipv6(addr):
-            """Expand :: notation to full IPv6 address"""
-            if "::" in addr:
-                addr = ipaddress.IPv6Address(addr).exploded
-            return addr
-
-        def make_solicit_addr(last_24):
-            """Create properly formatted solicited-node multicast address"""
-            last_part = format(int(last_24, 16), '06x')  # Ensure 6 hex digits
-            return f"ff02:0000:0000:0000:0000:0001:ff{last_part[:2]}:{last_part[2:]}"
-        
+    @contextmanager
+    def _setup_sniffer(self, probe: ProbeType, state: DiscoveryState) -> AsyncSniffer:
+        """Set up packet sniffer with appropriate filters."""
         def process_packet(pkt):
-            if IPv6 in pkt and (ICMPv6ND_NA in pkt or ICMPv6ND_NS in pkt):
-                src = pkt[IPv6].src
-                if '%' in src:
-                    src = src.split('%')[0]
-                if src not in self.discovered_hosts:
-                    mac = None
-                    if ICMPv6NDOptSrcLLAddr in pkt:
-                        mac = pkt[ICMPv6NDOptSrcLLAddr].lladdr
-                    elif Ether in pkt:
-                        mac = pkt[Ether].src
-                    self.discovered_hosts[src] = (mac, {'SOL'})
-                    print(f"[+] Host discovered via solicited-node: {src}")
-                else:
-                    self.discovered_hosts[src][1].add('SOL')
-        
-        # Start sniffer for responses
+            if not IPv6 in pkt:
+                return
+                
+            if not any(resp_type in pkt for resp_type in probe.response_types):
+                return
+            
+            src = pkt[IPv6].src.split('%')[0]
+            mac = self._extract_mac_from_packet(pkt)
+            
+            self._update_discovered_host(src, mac, probe, state)
+            
         sniffer = AsyncSniffer(
             iface=self.interface,
             filter="icmp6",
@@ -220,362 +425,202 @@ class IPv6Scanner:
             store=0
         )
         sniffer.start()
+        try:
+            yield sniffer
+        finally:
+            time.sleep(self.probe_wait * 2)
+            sniffer.stop()
+
+    def _handle_standard_probe(self, sock: socket.socket, probe: ProbeType, 
+                            state: DiscoveryState) -> None:
+        """Unified handler for default probe types."""
+        # Handle standard multicast probes
+        for group, description in self.MULTICAST_GROUPS.items():
+            state.current_group = group
+            print(f"\n[*] Probing {description} group ({group})")
+            
+            for i in range(2):
+                try:
+                    packet = probe.packet_creator(i)
+                    self._send_probe(sock, group, packet)
+                except Exception as e:
+                    print(f"[-] Error sending probe: {str(e)}")
+                    continue
+                
+                time.sleep(self.probe_wait)
+
+    def _handle_solicited_node_probe(self, sock: socket.socket, probe: ProbeType, 
+                            state: DiscoveryState) -> None:
+        print()
+        # Handle solicited-node probes
+        for host in list(self.discovered_hosts.keys()):
+            try:
+                solicit_addr = self._calculate_solicited_node_addr(host)
+                state.current_group = solicit_addr
+                
+                print(f"[*] Probing {host} via {solicit_addr}")
+                
+                packet = probe.packet_creator(state.src_addr, host)
+                self._send_probe(sock, solicit_addr, packet)
+                
+            except Exception as e:
+                print(f"[-] Error probing {host}: {str(e)}")
+                continue
+
+    def _handle_network_probe(self, sock: socket.socket, probe: ProbeType, 
+                            state: DiscoveryState) -> None:
+        """Handler for network scanning probes."""
+        discovered_networks = set()
+        for addr in self.discovered_hosts:
+            try:
+                network = ipaddress.IPv6Network(f"{addr}/{self.subnet_size}", 
+                                                strict=False)
+                discovered_networks.add(network)
+            except Exception:
+                continue
+
+        for network in discovered_networks:
+            try:
+                state.current_group="NET"
+                print(f"\n[*] Scanning network: {network}")
+                print(f"[*] Network size: {2 ** (128 - network.prefixlen):,} addresses")
+
+                # Send probes to each address in the network
+                for addr in network.hosts():
+                    addr_str = str(addr)
+                    try:
+                        packet = probe.packet_creator(addr_str)
+                        print(f"[*] Probing {addr_str}")
+                        self._send_probe(sock, addr_str, packet)
+                    except Exception as e:
+                        print(f"[-] Error probing {addr_str}: {str(e)}")
+                        continue
+
+            except Exception as e:
+                print(f"[-] Error during network scan: {str(e)}")
+
+    def _send_probe(self, sock: socket.socket, dst: str, packet: bytes) -> None:
+        """Send probe packet to destination."""
+        sock.sendto(packet, (f"{dst}%{self.interface}", 0, 0,
+                socket.if_nametoindex(self.interface)))
+        time.sleep(self.probe_wait)
+
+    def _extract_mac_from_packet(self, pkt) -> Optional[str]:
+        """Extract MAC address from packet in priority order."""
+        if ICMPv6NDOptSrcLLAddr in pkt:
+            return pkt[ICMPv6NDOptSrcLLAddr].lladdr
+        if Ether in pkt and pkt[Ether].src != "00:00:00:00:00:00":
+            return pkt[Ether].src
+        return self.extract_mac_from_ipv6(pkt[IPv6].src)
+
+    def _update_discovered_host(self, src: str, mac: Optional[str], 
+                            probe: ProbeType, state: DiscoveryState) -> None:
+        """Update discovered host information."""
+        is_new = src not in self.discovered_hosts
+        if is_new:
+            self.discovered_hosts[src] = (mac, set())
         
-        # Get our link-local address for the interface
+        # Add appropriate flag
+        if probe.name == 'solicit':
+            self.discovered_hosts[src][1].add('SOL')
+        elif state.current_group in self.MULTICAST_GROUPS:
+            self.discovered_hosts[src][1].add(self.MULTICAST_GROUPS[state.current_group])
+        elif state.current_group == "NET":
+            self.discovered_hosts[src][1].add("NET")
+
+        # Print discovery
+        self._print_discovery(src, mac, state.addr_padding)
+
+    def _print_discovery(self, src: str, mac: Optional[str], padding: int) -> None:
+        """Print discovered host information."""
+        addr_padding = " " * (padding - len(src))
+        mac_str = f"    {mac}" if mac else "    "
+        flags = self.format_flags(self.discovered_hosts[src][1])
+        print(f"[+] {src}{addr_padding}{mac_str}    {flags}")
+
+    def _get_link_local_address(self) -> Optional[str]:
+        """Get link-local address for the interface."""
         if_addrs = netifaces.ifaddresses(self.interface)
-        our_addr = None
         if netifaces.AF_INET6 in if_addrs:
             for addr in if_addrs[netifaces.AF_INET6]:
                 if 'addr' in addr and addr['addr'].startswith('fe80:'):
-                    our_addr = addr['addr'].split('%')[0]
-                    break
-        
-        if not our_addr:
-            print("[-] Could not find link-local address for interface")
-            return
-            
-        # Expand our source address
-        our_addr = expand_ipv6(our_addr)
-            
-        try:
-            # Create raw socket for sending NS packets
-            sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, 
-                        socket.if_nametoindex(self.interface))
-            
-            # Generate solicited-node multicast addresses from discovered hosts
-            for host in list(self.discovered_hosts.keys()):
-                try:
-                    addr = ipaddress.IPv6Address(host)
-                    # Get last 24 bits of address
-                    last_24 = format(int(addr) & 0xFFFFFF, '06x')
-                    # Create solicited-node multicast address
-                    solicit = make_solicit_addr(last_24)
-                    
-                    # Debug print
-                    print(f"[*] Probing {solicit}")
-                    print(f"[*] Source address: {our_addr}")
-                    
-                    # Create ICMPv6 Neighbor Solicitation message
-                    icmp_type = 135  # Neighbor Solicitation
-                    icmp_code = 0
-                    icmp_cksum = 0
-                    icmp_reserved = 0
-                    target_addr = socket.inet_pton(socket.AF_INET6, expand_ipv6(host))
-                    
-                    # Source Link-Layer Address option
-                    opt_type = 1
-                    opt_len = 1  # Length in units of 8 octets
-                    mac_bytes = bytes.fromhex(self.if_mac.replace(':', ''))
-                    
-                    # Build ICMPv6 packet with option
-                    icmp_msg = struct.pack('!BBHI', icmp_type, icmp_code, icmp_cksum, icmp_reserved) + \
-                            target_addr + \
-                            struct.pack('!BB', opt_type, opt_len) + mac_bytes
-                    
-                    # Calculate checksum (requires IPv6 pseudo-header)
-                    pseudo_header = socket.inet_pton(socket.AF_INET6, our_addr) + \
-                                socket.inet_pton(socket.AF_INET6, solicit) + \
-                                struct.pack('!I', len(icmp_msg)) + \
-                                b'\x00\x00\x00' + struct.pack('!B', socket.IPPROTO_ICMPV6)
-                    
-                    checksum = in6_chksum(socket.IPPROTO_ICMPV6, IPv6(src=our_addr, dst=solicit), icmp_msg)
-                    
-                    # Insert checksum into message
-                    icmp_msg = icmp_msg[:2] + struct.pack('!H', checksum) + icmp_msg[4:]
-                    
-                    # Send packet
-                    sock.sendto(icmp_msg, (f"{solicit}%{self.interface}", 0, 0, 
-                            socket.if_nametoindex(self.interface)))
-                    
-                    time.sleep(self.probe_wait)
-                    
-                except Exception as e:
-                    print(f"[-] Error probing {host}: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    
-            sock.close()
-            
-        except Exception as e:
-            print(f"[-] Error during solicited-node scan: {str(e)}")
-            import traceback
-            traceback.print_exc()
-        
-        # Wait for final responses
-        time.sleep(self.probe_wait * 2)
-        sniffer.stop()
+                    return addr['addr'].split('%')[0]
+        return None
 
-    def probe_multicast_neighbor_solicitation(self):
-        """Probe multicast targets using ICMPv6 Neighbor Solicitation messages"""
+    @staticmethod
+    def _calculate_solicited_node_addr(host: str) -> str:
+        """Calculate solicited-node multicast address for a host."""
+        addr = ipaddress.IPv6Address(host)
+        last_24 = format(int(addr) & 0xFFFFFF, '06x')
+        return f"ff02::1:ff{last_24[-6:-4]}:{last_24[-4:]}"
+
+    @staticmethod
+    def _print_probe_header(description: str) -> None:
+        """Print header for probe operation."""
         print("\n" + "-" * 80)
-        print("[*] Starting ICMPv6 multicast Neighbor Solicitation discovery...")
+        print(f"[*] Starting {description} discovery...")
         print("-" * 80)
-        
-        current_group = None  # Track current group being probed
-        addr_padding = 45  # Initial padding length for IPv6 addresses
-        
-        def process_packet(pkt):
-            """Process captured packets"""
-            if IPv6 in pkt:
-                if (ICMPv6EchoReply in pkt or 
-                    ICMPv6ND_NA in pkt or 
-                    ICMPv6ND_NS in pkt):
-                    src = pkt[IPv6].src
-                    if '%' in src:
-                        src = src.split('%')[0]
-                    
-                    # Process the packet
-                    src = pkt[IPv6].src
-                    if '%' in src:
-                        src = src.split('%')[0]
-                    
-                    # Get MAC address
-                    mac = None
-                    if Ether in pkt and pkt[Ether].src != "00:00:00:00:00:00":
-                        mac = pkt[Ether].src
-                    if not mac:
-                        mac = self.extract_mac_from_ipv6(src)
-                    
-                    # Add or update host
-                    if src not in self.discovered_hosts:
-                        self.discovered_hosts[src] = (mac, set())
-                    
-                    # If we're in a multicast probe, add the flag
-                    if current_group and current_group in self.multicast_groups:
-                        current_flag = self.multicast_groups[current_group]
-                        self.discovered_hosts[src][1].add(current_flag)
-                        padding = " " * (addr_padding - len(src))
-                        mac_str = f"    {self.discovered_hosts[src][0]}" if self.discovered_hosts[src][0] else "    "
-                        flags = self.format_flags(self.discovered_hosts[src][1])
-                        print(f"[+] {src}{padding}{mac_str}    {flags}")
 
-                    # Always add the current group flag if it exists
-                    if current_group and current_group in self.multicast_groups:
-                        is_new = src not in self.discovered_hosts
-                        current_flag = self.multicast_groups[current_group]
-                        
-                        if is_new:
-                            self.discovered_hosts[src] = (mac, {current_flag})
-                        else:
-                            self.discovered_hosts[src][1].add(current_flag)
-                            
-                        padding = " " * (addr_padding - len(src))
-                        mac_str = f"    {self.discovered_hosts[src][0]}" if self.discovered_hosts[src][0] else "    "
-                        flags = self.format_flags(self.discovered_hosts[src][1])
-                        print(f"[+] {src}{padding}{mac_str}    {flags}")
-        
-        try:
-            sniffer = AsyncSniffer(
-                iface=self.interface,
-                filter="icmp6",
-                prn=process_packet,
-                store=0
-            )
-            sniffer.start()
-            
-            sock = self.create_icmp6_socket()
-            if not sock:
-                return
-            
-            for group, description in self.multicast_groups.items():
-                current_group = group  # Set current group being probed
-                dst = f"{group}%{self.interface}"
-                print(f"\n[*] Probing {description} group ({group})")
-                
-                for i in range(2):
-                    try:
-                        # Send Neighbor Solicitation
-                        icmp_type = 135  # NS
-                        icmp_code = 0
-                        icmp_checksum = 0
-                        icmp_reserved = 0
-                        target_addr = socket.inet_pton(socket.AF_INET6, "::")  # Empty target address
-                        opt_type = 1  # Source Link-Layer Address
-                        opt_len = 1   # Length in 8-octet units
-                        mac_bytes = bytes.fromhex(self.if_mac.replace(':', ''))
-                        
-                        ns_packet = struct.pack('!BBHI', icmp_type, icmp_code,
-                                            icmp_checksum, icmp_reserved) + \
-                                target_addr + \
-                                struct.pack('!BB', opt_type, opt_len) + mac_bytes
-                        
-                        sock.sendto(ns_packet, (dst.split('%')[0], 0, 0,
-                                socket.if_nametoindex(self.interface)))
-                    
-                    except Exception as e:
-                        print(f"[-] Error sending probe: {str(e)}")
-                    
-                    time.sleep(self.probe_wait)
-            
-            current_group = None  # Clear current group
-            time.sleep(2)
-            sniffer.stop()
-            
-            if sock:
-                sock.close()
-                
-        except Exception as e:
-            print(f"[-] Error during scanning: {str(e)}")
-
-    def probe_multicast_ping(self):
-        """Probe multicast targets using IPv6 ping messages"""
-        print("\n" + "-" * 80)
-        print("[*] Starting IPv6 multicast ping discovery...")
-        print("-" * 80)
-        
-        current_group = None  # Track current group being probed
-        addr_padding = 45  # Initial padding length for IPv6 addresses
-        
-        def process_packet(pkt):
-            """Process captured packets"""
-            if IPv6 in pkt:
-                if (ICMPv6EchoReply in pkt or 
-                    ICMPv6ND_NA in pkt or 
-                    ICMPv6ND_NS in pkt):
-                    src = pkt[IPv6].src
-                    if '%' in src:
-                        src = src.split('%')[0]
-                    
-                    # Process the packet
-                    src = pkt[IPv6].src
-                    if '%' in src:
-                        src = src.split('%')[0]
-                    
-                    # Get MAC address
-                    mac = None
-                    if Ether in pkt and pkt[Ether].src != "00:00:00:00:00:00":
-                        mac = pkt[Ether].src
-                    if not mac:
-                        mac = self.extract_mac_from_ipv6(src)
-                    
-                    # Add or update host
-                    if src not in self.discovered_hosts:
-                        self.discovered_hosts[src] = (mac, set())
-                    
-                    # If we're in a multicast probe, add the flag
-                    if current_group and current_group in self.multicast_groups:
-                        current_flag = self.multicast_groups[current_group]
-                        self.discovered_hosts[src][1].add(current_flag)
-                        padding = " " * (addr_padding - len(src))
-                        mac_str = f"    {self.discovered_hosts[src][0]}" if self.discovered_hosts[src][0] else "    "
-                        flags = self.format_flags(self.discovered_hosts[src][1])
-                        print(f"[+] {src}{padding}{mac_str}    {flags}")
-
-                    # Always add the current group flag if it exists
-                    if current_group and current_group in self.multicast_groups:
-                        is_new = src not in self.discovered_hosts
-                        current_flag = self.multicast_groups[current_group]
-                        
-                        if is_new:
-                            self.discovered_hosts[src] = (mac, {current_flag})
-                        else:
-                            self.discovered_hosts[src][1].add(current_flag)
-                            
-                        padding = " " * (addr_padding - len(src))
-                        mac_str = f"    {self.discovered_hosts[src][0]}" if self.discovered_hosts[src][0] else "    "
-                        flags = self.format_flags(self.discovered_hosts[src][1])
-                        print(f"[+] {src}{padding}{mac_str}    {flags}")
-        
-        try:
-            sniffer = AsyncSniffer(
-                iface=self.interface,
-                filter="icmp6",
-                prn=process_packet,
-                store=0
-            )
-            sniffer.start()
-            
-            sock = self.create_icmp6_socket()
-            if not sock:
-                return
-            
-            for group, description in self.multicast_groups.items():
-                current_group = group  # Set current group being probed
-                dst = f"{group}%{self.interface}"
-                print(f"\n[*] Probing {description} group ({group})")
-                
-                for i in range(2):
-                    try:
-                        # Send ping
-                        icmp_type = 128
-                        icmp_code = 0
-                        icmp_checksum = 0
-                        icmp_id = os.getpid() & 0xFFFF
-                        icmp_seq = i
-                        icmp_data = b"PROBE"
-                        
-                        icmp_packet = struct.pack('!BBHHH', icmp_type, icmp_code,
-                                                icmp_checksum, icmp_id, icmp_seq) + icmp_data
-                        
-                        sock.sendto(icmp_packet, (dst.split('%')[0], 0, 0,
-                                   socket.if_nametoindex(self.interface)))
-                        
-                    except Exception as e:
-                        print(f"[-] Error sending probe: {str(e)}")
-                    
-                    time.sleep(self.probe_wait)
-            
-            current_group = None  # Clear current group
-            time.sleep(2)
-            sniffer.stop()
-            
-            if sock:
-                sock.close()
-                
-        except Exception as e:
-            print(f"[-] Error during scanning: {str(e)}")
-
-    def print_results(self):
-        """Print discovered hosts summary"""
+    def print_results(self) -> None:
+        """Print discovered hosts summary."""
         print("\n" + "=" * 80)
         print("[+] Discovered Hosts Summary:")
         print("=" * 80)
+        
         if not self.discovered_hosts:
-            print("  No hosts discovered")
-            print("\nTroubleshooting tips:")
-            print("1. Verify IPv6 connectivity:")
-            print(f"   ifconfig {self.interface} inet6")
-            print("2. Try manual test:")
-            print(f"   ping6 ff02::1%{self.interface}")
-            print("3. Check system firewall settings")
-        else:
-            # Find the longest IPv6 address for alignment
-            max_addr_len = max(len(addr) for addr in self.discovered_hosts.keys())
+            self._print_empty_results()
+            return
             
-            link_local = [(addr, info) for addr, info in self.discovered_hosts.items() 
-                         if addr.startswith('fe80:')]
-            global_addrs = [(addr, info) for addr, info in self.discovered_hosts.items() 
-                          if not addr.startswith('fe80:')]
-            
-            if link_local:
-                print("\nLink-local addresses:")
-                for addr, (mac, groups) in sorted(link_local):
-                    padding = " " * (max_addr_len - len(addr))
-                    mac_str = f"    {mac}" if mac else "    "
-                    flags = self.format_flags(groups)
-                    print(f"{addr}{padding}{mac_str}    {flags}")
-                    
-            if global_addrs:
-                print("\nGlobal addresses:")
-                for addr, (mac, groups) in sorted(global_addrs):
-                    padding = " " * (max_addr_len - len(addr))
-                    mac_str = f"    {mac}" if mac else "    "
-                    flags = self.format_flags(groups)
-                    print(f"{addr}{padding}{mac_str}    {flags}")
-                    
-            print(f"\nTotal hosts discovered: {len(self.discovered_hosts)}")
-            print("\nFlags explanation:")
-            print("  ALL   - All Nodes (ff02::1)")
-            print("  RTR   - All Routers (ff02::2)")
-            print("  DHCP  - All DHCP Servers (ff02::1:2)")
-            print("  MLDv2 - All MLDv2-capable Routers (ff02::16)")
-            print("  RELAY - All DHCP Relays (ff02::1:3)")
-            print("  SOL   - Responded to Solicited-Node multicast")
-            print("  NET   - Discovered via network scan")
+        # Find the longest IPv6 address for alignment
+        max_addr_len = max(len(addr) for addr in self.discovered_hosts.keys())
+        
+        # Split hosts into link-local and global
+        link_local = [(addr, info) for addr, info in self.discovered_hosts.items() 
+                     if addr.startswith('fe80:')]
+        global_addrs = [(addr, info) for addr, info in self.discovered_hosts.items() 
+                      if not addr.startswith('fe80:')]
+        
+        # Print results
+        self._print_address_section("Link-local addresses:", link_local, max_addr_len)
+        self._print_address_section("Global addresses:", global_addrs, max_addr_len)
+        
+        print(f"\nTotal hosts discovered: {len(self.discovered_hosts)}")
+        self._print_flags_explanation()
+
+    def _print_empty_results(self) -> None:
+        """Print message when no hosts are discovered."""
+        print("  No hosts discovered")
+        print("\nTroubleshooting tips:")
+        print("1. Verify IPv6 connectivity:")
+        print(f"   ifconfig {self.interface} inet6")
+        print("2. Try manual test:")
+        print(f"   ping6 ff02::1%{self.interface}")
+        print("3. Check system firewall settings")
+
+    def _print_address_section(self, title: str, addresses: list, padding: int) -> None:
+        """Print a section of addresses with consistent formatting."""
+        if addresses:
+            print(f"\n{title}")
+            for addr, (mac, groups) in sorted(addresses):
+                addr_padding = " " * (padding - len(addr))
+                mac_str = f"    {mac}" if mac else "    "
+                flags = self.format_flags(groups)
+                print(f"{addr}{addr_padding}{mac_str}    {flags}")
+
+    def _print_flags_explanation(self) -> None:
+        """Print explanation of flag meanings."""
+        print("\nFlags explanation:")
+        print("  ALL   - All Nodes (ff02::1)")
+        print("  RTR   - All Routers (ff02::2)")
+        print("  DHCP  - All DHCP Servers (ff02::1:2)")
+        print("  MLDv2 - All MLDv2-capable Routers (ff02::16)")
+        print("  RELAY - All DHCP Relays (ff02::1:3)")
+        print("  SOL   - Responded to Solicited-Node multicast")
+        print("  NET   - Discovered via network scan")
+
 
 def main():
+    """Main entry point for the IPv6 scanner."""
     parser = argparse.ArgumentParser(
         description='IPv6 network scanner',
         formatter_class=argparse.RawTextHelpFormatter
@@ -590,14 +635,15 @@ def main():
                        help='Include solicited-node multicast scanning')
     parser.add_argument('-n', '--network', action='store_true',
                        help='Scan networks of discovered hosts (default: /125 = 8 addresses)')
-    parser.add_argument('--max-prefix', type=int, default=125,
-                       help='Maximum prefix length for network scanning (example: 120 for /120 = 256 addresses). \n' +
+    parser.add_argument('--subnet-size', type=int, default=125,
+                       help='Subnet size is the prefix length for network scanning (example: 120 for /120 = 256 addresses). \n' +
                             'Smaller number = larger network = longer scan time. Default: 125 for /125 = 8 addresses')
     
     args = parser.parse_args()
 
-    if args.max_prefix != 125 and not args.network:  # 125 is the default value
-        print("Error: --max-prefix can only be used with -n/--network option")
+    # Validate arguments
+    if args.subnet_size != 125 and not args.network:
+        print("Error: --subnet-size can only be used with -n/--network option")
         sys.exit(1)
 
     if args.list:
@@ -610,44 +656,39 @@ def main():
         IPv6Scanner.list_interfaces()
         sys.exit(1)
         
-    # Validate prefix length
-    if args.max_prefix < 1 or args.max_prefix > 128:
+    if args.subnet_size < 1 or args.subnet_size > 128:
         print("Error: Prefix length must be between 1 and 128")
         sys.exit(1)
         
+    # Initialize and run scanner
     scanner = IPv6Scanner(args.interface)
     scanner.probe_wait = args.wait
     scanner.solicit_scan = args.solicit
     scanner.network_scan = args.network
-    scanner.subnet_size_limit = args.max_prefix
+    scanner.subnet_size = args.subnet_size
     
-    # First do multicast neighbor solicitation scan
-    scanner.probe_multicast_neighbor_solicitation()
+    try:
+        # Execute scanning sequence
+        scanner.probe_multicast(scanner.probes['ping'])    # Ping probes
+        scanner.probe_multicast(scanner.probes['ns'])      # Neighbor Solicitation probes
+        
+        if args.solicit:
+            scanner.probe_multicast(scanner.probes['solicit'])  # Solicited-node multicast probes
+        
+        if args.network:
+            scanner.probe_multicast(scanner.probes['network'])  # Scan nearby networks
+        
+        scanner.print_results()
+        
+    except KeyboardInterrupt:
+        print("\n[*] Scan interrupted by user")
+        scanner.print_results()
+    except Exception as e:
+        print(f"\n[-] Error during scanning: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
-    # Then do multicast ping scan
-    scanner.probe_multicast_ping()
-    
-    # Then do solicited-node scan if requested
-    if args.solicit:
-        scanner.probe_solicited_node()
-        
-    # Finally do network scan if requested
-    if args.network:
-        print("\n" + "-" * 80)
-        print("[*] Scanning nearby networks...")
-        print("-" * 80)
-        discovered_networks = set()
-        for addr in scanner.discovered_hosts:
-            try:
-                network = ipaddress.IPv6Network(f"{addr}/{scanner.subnet_size_limit}", strict=False)
-                discovered_networks.add(str(network))
-            except Exception:
-                continue
-        
-        for network in discovered_networks:
-            scanner.scan_network(network)
-    
-    scanner.print_results()
 
 if __name__ == "__main__":
     main()
