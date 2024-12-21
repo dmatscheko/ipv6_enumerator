@@ -30,5 +30,5 @@ cd ipv6_enumerator
 python -m venv venv
 source venv/bin/activate
 # necessary:
-pip install netifaces scapy
+pip install netifaces scapy ipaddress
 ```
