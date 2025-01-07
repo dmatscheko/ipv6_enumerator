@@ -17,11 +17,11 @@ Required packages:
     - ipaddress
 
 Usage:
-    sudo python3 scanner.py [-h] [-l] [-w WAIT] [-s] [-n] [--subnet-size SUBNET_SIZE] [interface]
+    sudo python3 scanner.py [-h] [-l] [-w WAIT] [-p] [-n] [-a] [--group-all] [--group-routers] [--group-dhcp] [--group-mldv2] [--group-relay] [--all-groups] [-s] [-k] [--subnet-size SUBNET_SIZE] [interface]
 
 Author: D. Matscheko
 License: GPLv3
-Version: 0.0.2
+Version: 0.0.3
 """
 
 import sys
@@ -409,9 +409,10 @@ class IPv6Scanner:
         def process_packet(pkt):
             if not IPv6 in pkt:
                 return
-                
-            if not any(resp_type in pkt for resp_type in probe.response_types):
-                return
+            
+            # Filtering received packets is not necessary since the goal is to find ans many addresses as possible:
+            # if not any(resp_type in pkt for resp_type in probe.response_types):
+            #     return
             
             src = pkt[IPv6].src.split('%')[0]
             mac = self._extract_mac_from_packet(pkt)
@@ -595,7 +596,7 @@ class IPv6Scanner:
         print(f"   ifconfig {self.interface} inet6")
         print("2. Try manual test:")
         print(f"   ping6 ff02::1%{self.interface}")
-        print("3. Check system firewall settings")
+        print("3. Check system firewall settings and verify that python runs as root")
 
     def _print_address_section(self, title: str, addresses: list, padding: int) -> None:
         """Print a section of addresses with consistent formatting."""
@@ -631,9 +632,33 @@ def main():
                        help='List active network interfaces')
     parser.add_argument('-w', '--wait', type=float, default=0.5,
                        help='Time to wait for responses after each multicast probe (default: 0.5s)')
+    
+    # Group scanning method flags
+    parser.add_argument('-p', '--ping', action='store_true',
+                       help='Enable ICMPv6 Multicast Groups Echo Request discovery')
+    parser.add_argument('-n', '--ns', action='store_true',
+                       help='Enable ICMPv6 Multicast Groups Neighbor Solicitation discovery')
+    parser.add_argument('-a', '--all', action='store_true',
+                       help='Enable all scanning methods and groups')
+    
+    # Multicast group flags
+    parser.add_argument('--group-all', action='store_true',
+                       help='Probe ALL group (ff02::1)')
+    parser.add_argument('--group-routers', action='store_true',
+                       help='Probe RTR group (ff02::2)')
+    parser.add_argument('--group-dhcp', action='store_true',
+                       help='Probe DHCP group (ff02::1:2)')
+    parser.add_argument('--group-mldv2', action='store_true',
+                       help='Probe MLDv2 group (ff02::16)')
+    parser.add_argument('--group-relay', action='store_true',
+                       help='Probe RELAY group (ff02::1:3)')
+    parser.add_argument('--all-groups', action='store_true',
+                       help='Probe all multicast groups')
+    
+    # Additional scanning methods
     parser.add_argument('-s', '--solicit', action='store_true',
                        help='Include solicited-node multicast scanning')
-    parser.add_argument('-n', '--network', action='store_true',
+    parser.add_argument('-k', '--network', action='store_true',
                        help='Scan networks of discovered hosts (default: /125 = 8 addresses)')
     parser.add_argument('--subnet-size', type=int, default=125,
                        help='Subnet size is the prefix length for network scanning (example: 120 for /120 = 256 addresses). \n' +
@@ -643,7 +668,7 @@ def main():
 
     # Validate arguments
     if args.subnet_size != 125 and not args.network:
-        print("Error: --subnet-size can only be used with -n/--network option")
+        print("Error: --subnet-size can only be used with -k/--network option")
         sys.exit(1)
 
     if args.list:
@@ -659,27 +684,54 @@ def main():
     if args.subnet_size < 1 or args.subnet_size > 128:
         print("Error: Prefix length must be between 1 and 128")
         sys.exit(1)
-        
-    # Initialize and run scanner
+
+    # Initialize scanner
     scanner = IPv6Scanner(args.interface)
     scanner.probe_wait = args.wait
-    scanner.solicit_scan = args.solicit
-    scanner.network_scan = args.network
+    scanner.solicit_scan = args.solicit or args.all
+    scanner.network_scan = args.network or args.all
     scanner.subnet_size = args.subnet_size
-    
+
+    # Determine which groups to scan
+    active_groups = set()
+    if args.all_groups or args.all or not any([args.group_all, args.group_routers, args.group_dhcp, 
+                                    args.group_mldv2, args.group_relay]):
+        # If no specific groups are selected or all-groups/all is set, use all groups or just ALL group
+        active_groups = {'ff02::1'} if not (args.all_groups or args.all) else set(scanner.MULTICAST_GROUPS.keys())
+    else:
+        # Add specifically requested groups
+        if args.group_all:
+            active_groups.add('ff02::1')
+        if args.group_routers:
+            active_groups.add('ff02::2')
+        if args.group_dhcp:
+            active_groups.add('ff02::1:2')
+        if args.group_mldv2:
+            active_groups.add('ff02::16')
+        if args.group_relay:
+            active_groups.add('ff02::1:3')
+
+    # Store active groups in scanner
+    scanner.MULTICAST_GROUPS = {addr: desc for addr, desc in scanner.MULTICAST_GROUPS.items() 
+                              if addr in active_groups}
+
     try:
-        # Execute scanning sequence
-        scanner.probe_multicast(scanner.probes['ping'])    # Ping probes
-        scanner.probe_multicast(scanner.probes['ns'])      # Neighbor Solicitation probes
-        
-        if args.solicit:
-            scanner.probe_multicast(scanner.probes['solicit'])  # Solicited-node multicast probes
-        
-        if args.network:
-            scanner.probe_multicast(scanner.probes['network'])  # Scan nearby networks
-        
+        # Execute scanning sequence based on enabled methods
+        if args.all or args.ping or not args.ns:
+            # Run ping probe by default if no other method is specified
+            scanner.probe_multicast(scanner.probes['ping'])
+
+        if args.all or args.ns:
+            scanner.probe_multicast(scanner.probes['ns'])
+
+        if scanner.solicit_scan:
+            scanner.probe_multicast(scanner.probes['solicit'])
+
+        if scanner.network_scan:
+            scanner.probe_multicast(scanner.probes['network'])
+
         scanner.print_results()
-        
+
     except KeyboardInterrupt:
         print("\n[*] Scan interrupted by user")
         scanner.print_results()
