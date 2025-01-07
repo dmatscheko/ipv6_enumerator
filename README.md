@@ -15,15 +15,20 @@ options:
   -h, --help            show this help message and exit
   -l, --list            List active network interfaces
   -w WAIT, --wait WAIT  Time to wait for responses after each multicast probe (default: 0.5s)
+
   -p, --ping            Enable ICMPv6 Multicast Groups Echo Request discovery
   -n, --ns              Enable ICMPv6 Multicast Groups Neighbor Solicitation discovery
+
   -a, --all             Enable all scanning methods and groups
+
   --group-all           Probe ALL group (ff02::1)
   --group-routers       Probe RTR group (ff02::2)
   --group-dhcp          Probe DHCP group (ff02::1:2)
   --group-mldv2         Probe MLDv2 group (ff02::16)
   --group-relay         Probe RELAY group (ff02::1:3)
+
   --all-groups          Probe all multicast groups
+
   -s, --solicit         Include solicited-node multicast scanning
   -k, --network         Scan networks of discovered hosts (default: /125 = 8 addresses)
   --subnet-size SUBNET_SIZE
