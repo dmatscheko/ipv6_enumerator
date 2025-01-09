@@ -2,14 +2,14 @@
 """
 IPv6 Network Scanner
 
-This script provides IPv6 host discovery using:
+The scanner supports IPv6 host discovery using:
 - Multicast group discovery
 - Neighbor solicitation
 - Solicited-node multicast scanning
 - Network scanning
 
-The scanner supports various discovery methods and provides information about
-discovered hosts, their MAC addresses, and multicast group memberships.
+The scanner provides information about discovered hosts, their MAC addresses,
+and multicast group memberships.
 
 Required packages:
     - scapy
