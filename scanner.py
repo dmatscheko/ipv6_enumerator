@@ -17,11 +17,11 @@ Required packages:
     - ipaddress
 
 Usage:
-    sudo python3 scanner.py [-h] [-l] [-w WAIT] [-p] [-n] [-a] [--group-all] [--group-routers] [--group-dhcp] [--group-mldv2] [--group-relay] [--all-groups] [-s] [-k] [--subnet-size SUBNET_SIZE] [interface]
+    sudo python scanner.py [-h] [-l] [-w WAIT] [-p] [-n] [-a] [--group-all] [--group-routers] [--group-dhcp] [--group-mldv2] [--group-relay] [--all-groups] [-s] [-k] [--subnet-size SUBNET_SIZE] [interface]
 
 Author: D. Matscheko
 License: GPLv3
-Version: 0.0.3
+Version: 0.0.4
 """
 
 import sys
@@ -79,65 +79,52 @@ class ProbeType:
 
 class ICMPv6PacketBuilder:
     """Builder for ICMPv6 packets."""
+    # ICMPv6 type constants
+    ICMPV6_ECHO_REQUEST = 128
+    ICMPV6_NS = 135
+
     def __init__(self, if_mac: str):
+        """Initialize the packet builder with interface MAC address."""
         self.if_mac = if_mac
         self.mac_bytes = bytes.fromhex(if_mac.replace(':', ''))
 
-    def create_ping(self, seq: int) -> bytes:
-        """Create an ICMPv6 Echo Request packet."""
+    def create_ping(self, seq: int, src_addr: str, target_addr: str = "ff02::1") -> bytes:
+        """
+        Create an ICMPv6 Echo Request packet.
+        If no target_addr is given, creates a multicast ping.
+        Otherwise creates a unicast ping to the specified target.
+        """
+        payload = struct.pack('!HH', os.getpid() & 0xFFFF, seq)
+        
         return self._create_icmpv6_packet(
-            icmp_type=128,  # Echo Request
-            icmp_code=0,
-            additional_data=struct.pack('!HH', os.getpid() & 0xFFFF, seq) + b"PROBE"
-        )
-
-    def create_network_ping(self, target_addr: str) -> bytes:
-        """Create an ICMPv6 Echo Request packet for a specific target."""
-        return self._create_icmpv6_packet(
-            icmp_type=128,  # Echo Request
-            icmp_code=0,
-            additional_data=struct.pack('!HH', os.getpid() & 0xFFFF, 1) + b"PROBE"
-        )
-
-    def create_multicast_ns(self, seq: int = None) -> bytes:
-        """Create a multicast Neighbor Solicitation packet."""
-        target_addr = socket.inet_pton(socket.AF_INET6, "::")
-        return self._create_ns_packet(target_addr)
-
-    def create_unicast_ns(self, src_addr: str, target_addr: str) -> bytes:
-        """Create a unicast Neighbor Solicitation packet."""
-        target = socket.inet_pton(socket.AF_INET6, target_addr)
-        return self._create_ns_packet(
-            target,
+            icmp_type=self.ICMPV6_ECHO_REQUEST,
             src_addr=src_addr,
             dst_addr=target_addr,
-            add_checksum=True
+            payload=payload
         )
 
-    def _create_ns_packet(self, target: bytes, src_addr: str = None, 
-                         dst_addr: str = None, add_checksum: bool = False) -> bytes:
-        """Create base NS packet with optional checksum."""
-        # Source Link-Layer Address option
+    def create_ns(self, seq: int, src_addr: str, target_addr: str = "ff02::1") -> bytes:
+        """
+        Create a Neighbor Solicitation packet.
+        If no target_addr is given, creates a multicast NS.
+        Otherwise creates a unicast NS to the specified target.
+        """
+        target = socket.inet_pton(socket.AF_INET6, target_addr)
+        reserved = b'\x00' * 4
         lladdr_opt = struct.pack('!BB', 1, 1) + self.mac_bytes
+        payload = reserved + target + lladdr_opt
         
-        packet = self._create_icmpv6_packet(
-            icmp_type=135,  # Neighbor Solicitation
-            icmp_code=0,
-            additional_data=target + lladdr_opt
+        return self._create_icmpv6_packet(
+            icmp_type=self.ICMPV6_NS,
+            src_addr=src_addr,
+            dst_addr=target_addr,
+            payload=payload
         )
-        
-        if add_checksum and src_addr and dst_addr:
-            packet = self._add_checksum(packet, src_addr, dst_addr)
-            
-        return packet
 
-    def _create_icmpv6_packet(self, icmp_type: int, icmp_code: int, 
-                             additional_data: bytes = b'') -> bytes:
-        """Create a basic ICMPv6 packet."""
-        return struct.pack('!BBH', icmp_type, icmp_code, 0) + additional_data
-
-    def _add_checksum(self, packet: bytes, src_addr: str, dst_addr: str) -> bytes:
-        """Add checksum to an ICMPv6 packet."""
+    def _create_icmpv6_packet(self, icmp_type: int, src_addr: str, dst_addr: str, 
+                            payload: bytes = b'', icmp_code: int = 0) -> bytes:
+        """Create an ICMPv6 packet with checksum."""
+        packet = struct.pack('!BBH', icmp_type, icmp_code, 0) + payload
         checksum = in6_chksum(
             socket.IPPROTO_ICMPV6,
             IPv6(src=src_addr, dst=dst_addr),
@@ -199,13 +186,6 @@ class IPv6Scanner:
         probes = {
             probe.name: probe for probe in [
                 ProbeType(
-                    name='ns',
-                    description='ICMPv6 Multicast Groups Neighbor Solicitation',
-                    packet_creator=self.packet_builder.create_multicast_ns,
-                    response_types=[ICMPv6ND_NA, ICMPv6ND_NS],
-                    handler=self._handle_standard_probe
-                ),
-                ProbeType(
                     name='ping',
                     description='ICMPv6 Multicast Groups Echo Request',
                     packet_creator=self.packet_builder.create_ping,
@@ -213,9 +193,16 @@ class IPv6Scanner:
                     handler=self._handle_standard_probe
                 ),
                 ProbeType(
+                    name='ns',
+                    description='ICMPv6 Multicast Groups Neighbor Solicitation',
+                    packet_creator=self.packet_builder.create_ns,
+                    response_types=[ICMPv6ND_NA, ICMPv6ND_NS],
+                    handler=self._handle_standard_probe
+                ),
+                ProbeType(
                     name='solicit',
                     description='ICMPv6 Solicited-Node Multicast',
-                    packet_creator=self.packet_builder.create_unicast_ns,
+                    packet_creator=self.packet_builder.create_ns,
                     response_types=[ICMPv6ND_NA, ICMPv6ND_NS],
                     needs_src_addr=True,
                     handler=self._handle_solicited_node_probe
@@ -223,7 +210,7 @@ class IPv6Scanner:
                 ProbeType(
                     name='network',
                     description='ICMPv6 Nearby Network',
-                    packet_creator=self.packet_builder.create_network_ping,
+                    packet_creator=self.packet_builder.create_ping,
                     response_types=[ICMPv6EchoReply],
                     handler=self._handle_network_probe
                 )
@@ -442,7 +429,7 @@ class IPv6Scanner:
             
             for i in range(2):
                 try:
-                    packet = probe.packet_creator(i)
+                    packet = probe.packet_creator(seq=i, src_addr=state.src_addr)
                     self._send_probe(sock, group, packet)
                 except Exception as e:
                     print(f"[-] Error sending probe: {str(e)}")
@@ -461,7 +448,7 @@ class IPv6Scanner:
                 
                 print(f"[*] Probing {host} via {solicit_addr}")
                 
-                packet = probe.packet_creator(state.src_addr, host)
+                packet = probe.packet_creator(seq=0, src_addr=state.src_addr, target_addr=solicit_addr)
                 self._send_probe(sock, solicit_addr, packet)
                 
             except Exception as e:
@@ -490,7 +477,7 @@ class IPv6Scanner:
                 for addr in network.hosts():
                     addr_str = str(addr)
                     try:
-                        packet = probe.packet_creator(addr_str)
+                        packet = probe.packet_creator(seq=1, src_addr=state.src_addr, target_addr=addr_str)
                         print(f"[*] Probing {addr_str}")
                         self._send_probe(sock, addr_str, packet)
                     except Exception as e:
