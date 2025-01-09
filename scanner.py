@@ -6,7 +6,7 @@ The scanner supports IPv6 host discovery using:
 - Multicast group discovery
 - Neighbor solicitation
 - Solicited-node multicast scanning
-- Network scanning
+- Adjacent subnet scanning around discovered hosts
 
 The scanner provides information about discovered hosts, their MAC addresses,
 and multicast group memberships.
