@@ -21,7 +21,7 @@ Usage:
 
 Author: D. Matscheko
 License: GPLv3
-Version: 0.0.4
+Version: 0.0.5
 """
 
 import sys
@@ -629,16 +629,16 @@ def main():
                        help='Enable all scanning methods and groups')
     
     # Multicast group flags
-    parser.add_argument('--group-all', action='store_true',
-                       help='Probe ALL group (ff02::1)')
+    parser.add_argument('--group-all-nodes', action='store_true',
+                       help='Probe all nodes = ALL group = ff02::1')
     parser.add_argument('--group-routers', action='store_true',
-                       help='Probe RTR group (ff02::2)')
+                       help='Probe all routers = RTR group = ff02::2')
     parser.add_argument('--group-dhcp', action='store_true',
-                       help='Probe DHCP group (ff02::1:2)')
+                       help='Probe all DHCP servers = DHCP group = ff02::1:2')
     parser.add_argument('--group-mldv2', action='store_true',
-                       help='Probe MLDv2 group (ff02::16)')
+                       help='Probe all MLDv2-capable routers = MLDv2 group = ff02::16')
     parser.add_argument('--group-relay', action='store_true',
-                       help='Probe RELAY group (ff02::1:3)')
+                       help='Probe all DHCP relays = RELAY group = ff02::1:3')
     parser.add_argument('--all-groups', action='store_true',
                        help='Probe all multicast groups')
     
@@ -681,13 +681,12 @@ def main():
 
     # Determine which groups to scan
     active_groups = set()
-    if args.all_groups or args.all or not any([args.group_all, args.group_routers, args.group_dhcp, 
-                                    args.group_mldv2, args.group_relay]):
-        # If no specific groups are selected or all-groups/all is set, use all groups or just ALL group
-        active_groups = {'ff02::1'} if not (args.all_groups or args.all) else set(scanner.MULTICAST_GROUPS.keys())
+    if args.all_groups or args.all:
+        # If all-groups/all is set, use all groups
+        active_groups = set(scanner.MULTICAST_GROUPS.keys())
     else:
         # Add specifically requested groups
-        if args.group_all:
+        if args.group_all_nodes:
             active_groups.add('ff02::1')
         if args.group_routers:
             active_groups.add('ff02::2')
@@ -697,6 +696,9 @@ def main():
             active_groups.add('ff02::16')
         if args.group_relay:
             active_groups.add('ff02::1:3')
+    if not active_groups:
+        # If no specific groups are selected, use at least the ALL Nodes group (ff02::1)
+        active_groups = {'ff02::1'}
 
     # Store active groups in scanner
     scanner.MULTICAST_GROUPS = {addr: desc for addr, desc in scanner.MULTICAST_GROUPS.items() 
