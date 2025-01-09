@@ -17,7 +17,7 @@ Required packages:
     - ipaddress
 
 Usage:
-    sudo python scanner.py [-h] [-l] [-w WAIT] [-p] [-n] [-a] [--group-all] [--group-routers] [--group-dhcp] [--group-mldv2] [--group-relay] [--all-groups] [-s] [-k] [--subnet-size SUBNET_SIZE] [interface]
+    sudo python scanner.py [-h] [-l] [-w WAIT] [-p] [-n] [-a] [--group-all-nodes] [--group-routers] [--group-dhcp] [--group-mldv2] [--group-relay] [--all-groups] [-s] [-k] [--subnet-size SUBNET_SIZE] [interface]
 
 Author: D. Matscheko
 License: GPLv3
