@@ -8,7 +8,7 @@ This script provides IPv6 host discovery using:
 - Solicited-node multicast scanning
 - Network scanning
 
-The scanner supports various discovery methods and provides detailed output about
+The scanner supports various discovery methods and provides information about
 discovered hosts, their MAC addresses, and multicast group memberships.
 
 Required packages:
@@ -17,7 +17,7 @@ Required packages:
     - ipaddress
 
 Usage:
-    sudo python scanner.py [-h] [-l] [-w WAIT] [-p] [-n] [-a] [--group-all-nodes] [--group-routers] [--group-dhcp] [--group-mldv2] [--group-relay] [--all-groups] [-s] [-k] [--subnet-size SUBNET_SIZE] [interface]
+    sudo python scanner.py [-h] [-l] [-p] [-n] [-s] [-k] [--group-all-nodes] [--group-routers] [--group-dhcp] [--group-mldv2] [--group-relay] [-a] [-g] [-w WAIT] [--subnet-size SUBNET_SIZE] [interface]
 
 Author: D. Matscheko
 License: GPLv3
@@ -614,43 +614,51 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     
-    parser.add_argument('interface', nargs='?', help='Network interface to scan')
-    parser.add_argument('-l', '--list', action='store_true', 
-                       help='List active network interfaces')
-    parser.add_argument('-w', '--wait', type=float, default=0.5,
-                       help='Time to wait for responses after each multicast probe (default: 0.5s)')
+    # Basic options
+    basic_group = parser.add_argument_group('basic options')
+    basic_group.add_argument('interface', nargs='?', help='Network interface to scan')
+    basic_group.add_argument('-l', '--list', action='store_true', 
+                          help='List active network interfaces')
     
-    # Group scanning method flags
-    parser.add_argument('-p', '--ping', action='store_true',
-                       help='Enable ICMPv6 Multicast Groups Echo Request discovery')
-    parser.add_argument('-n', '--ns', action='store_true',
-                       help='Enable ICMPv6 Multicast Groups Neighbor Solicitation discovery')
-    parser.add_argument('-a', '--all', action='store_true',
-                       help='Enable all scanning methods and groups')
+    # Discovery methods
+    discovery_group = parser.add_argument_group('discovery methods')
+    discovery_group.add_argument('-p', '--ping', action='store_true',
+                             help='Enable ICMPv6 Multicast Groups Echo Request discovery')
+    discovery_group.add_argument('-n', '--ns', action='store_true',
+                             help='Enable ICMPv6 Multicast Groups Neighbor Solicitation discovery')
+    discovery_group.add_argument('-s', '--solicit', action='store_true',
+                             help='Include solicited-node multicast discovery')
+    discovery_group.add_argument('-k', '--network', action='store_true',
+                           help='Scan networks of discovered hosts (default: /125 = 8 addresses)')
     
-    # Multicast group flags
-    parser.add_argument('--group-all-nodes', action='store_true',
-                       help='Probe all nodes = ALL group = ff02::1')
-    parser.add_argument('--group-routers', action='store_true',
-                       help='Probe all routers = RTR group = ff02::2')
-    parser.add_argument('--group-dhcp', action='store_true',
-                       help='Probe all DHCP servers = DHCP group = ff02::1:2')
-    parser.add_argument('--group-mldv2', action='store_true',
-                       help='Probe all MLDv2-capable routers = MLDv2 group = ff02::16')
-    parser.add_argument('--group-relay', action='store_true',
-                       help='Probe all DHCP relays = RELAY group = ff02::1:3')
-    parser.add_argument('--all-groups', action='store_true',
-                       help='Probe all multicast groups')
+    # Multicast groups
+    group_group = parser.add_argument_group('multicast groups')
+    group_group.add_argument('--group-all-nodes', action='store_true',
+                          help='Probe all nodes = ALL group = ff02::1')
+    group_group.add_argument('--group-routers', action='store_true',
+                          help='Probe all routers = RTR group = ff02::2')
+    group_group.add_argument('--group-dhcp', action='store_true',
+                          help='Probe all DHCP servers = DHCP group = ff02::1:2')
+    group_group.add_argument('--group-mldv2', action='store_true',
+                          help='Probe all MLDv2-capable routers = MLDv2 group = ff02::16')
+    group_group.add_argument('--group-relay', action='store_true',
+                          help='Probe all DHCP relays = RELAY group = ff02::1:3')
+
+    # General options
+    general_group = parser.add_argument_group('general options')
+    general_group.add_argument('-a', '--all', action='store_true',
+                           help='Enable all discovery methods and probe all multicast groups')
+    general_group.add_argument('-g', '--all-groups', action='store_true',
+                          help='Probe all multicast groups')
     
-    # Additional scanning methods
-    parser.add_argument('-s', '--solicit', action='store_true',
-                       help='Include solicited-node multicast scanning')
-    parser.add_argument('-k', '--network', action='store_true',
-                       help='Scan networks of discovered hosts (default: /125 = 8 addresses)')
-    parser.add_argument('--subnet-size', type=int, default=125,
-                       help='Subnet size is the prefix length for network scanning (example: 120 for /120 = 256 addresses). \n' +
-                            'Smaller number = larger network = longer scan time. Default: 125 for /125 = 8 addresses')
-    
+    # Advanced discovery options
+    advanced_group = parser.add_argument_group('advanced discovery options')
+    advanced_group.add_argument('-w', '--wait', type=float, default=0.5,
+                          help='Time to wait for responses after each multicast probe (default: 0.5s)')
+    advanced_group.add_argument('--subnet-size', type=int, default=125,
+                           help='Subnet size is the prefix length for network scanning (example: 120 for /120 = 256 addresses). \n' +
+                                'Smaller number = larger network = longer scan time. Default: 125 for /125 = 8 addresses')
+
     args = parser.parse_args()
 
     # Validate arguments
