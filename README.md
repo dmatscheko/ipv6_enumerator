@@ -4,7 +4,7 @@ Host discovery in IPv6 networks.
 
 ### Usage:
 ```
-sudo python scanner.py [-h] [-l] [-w WAIT] [-p] [-n] [-a] [--group-all] [--group-routers] [--group-dhcp] [--group-mldv2] [--group-relay] [--all-groups] [-s] [-k] [--subnet-size SUBNET_SIZE] [interface]
+sudo python scanner.py [-h] [-l] [-w WAIT] [-p] [-n] [-a] [--group-all-nodes] [--group-routers] [--group-dhcp] [--group-mldv2] [--group-relay] [--all-groups] [-s] [-k] [--subnet-size SUBNET_SIZE] [interface]
 
 IPv6 network scanner
 
@@ -21,11 +21,11 @@ options:
 
   -a, --all             Enable all scanning methods and groups
 
-  --group-all           Probe ALL group (ff02::1)
-  --group-routers       Probe RTR group (ff02::2)
-  --group-dhcp          Probe DHCP group (ff02::1:2)
-  --group-mldv2         Probe MLDv2 group (ff02::16)
-  --group-relay         Probe RELAY group (ff02::1:3)
+  --group-all-nodes     Probe all nodes = ALL group = ff02::1
+  --group-routers       Probe all routers = RTR group = ff02::2
+  --group-dhcp          Probe all DHCP servers = DHCP group = ff02::1:2
+  --group-mldv2         Probe all MLDv2-capable routers = MLDv2 group = ff02::16
+  --group-relay         Probe all DHCP relays = RELAY group = ff02::1:3
 
   --all-groups          Probe all multicast groups
 
