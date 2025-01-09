@@ -1,6 +1,15 @@
 # IPv6 Enumerator
 Host discovery in IPv6 networks.
 
+### Overview:
+The scanner supports IPv6 host discovery using:
+- Multicast group discovery
+- Neighbor solicitation
+- Solicited-node multicast scanning
+- Network scanning
+
+The scanner provides information about discovered hosts, their MAC addresses,
+and multicast group memberships.
 
 ### Usage:
 ```
